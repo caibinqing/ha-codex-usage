@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect your Codex account",
+        "description": "On the machine where you use the Codex CLI, run `codex login` if you haven't, then paste the full contents of `~/.codex/auth.json` below.\n\nHome Assistant keeps its own copy of the tokens and refreshes them automatically.\n\nIf Home Assistant cannot reach OpenAI directly, set an outbound proxy (http://host:port) — it is used immediately for this validation.",
+        "data": {
+          "auth_json": "Contents of ~/.codex/auth.json",
+          "proxy_url": "Outbound proxy URL (optional)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Codex Usage",
+        "description": "The stored token no longer works. Paste the current contents of `~/.codex/auth.json` again (run `codex login` first if needed).",
+        "data": {
+          "auth_json": "Contents of ~/.codex/auth.json"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth_json": "Could not parse the pasted content. It must be the JSON from ~/.codex/auth.json, containing tokens.access_token and tokens.refresh_token.",
+      "cannot_connect": "The usage API rejected these credentials. Make sure the auth.json is fresh (log in again with `codex login`).",
+      "invalid_proxy": "Proxy URL must start with http:// (aiohttp tunnels HTTPS via CONNECT and does not accept https:// proxies)."
+    },
+    "abort": {
+      "already_configured": "This Codex account is already configured",
+      "reauth_successful": "Re-authentication was successful"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Codex Usage Options",
+        "description": "Configure the polling interval and an optional outbound proxy.",
+        "data": {
+          "update_interval": "Update interval (seconds)",
+          "proxy_url": "Outbound proxy URL (optional, http://host:port)"
+        }
+      }
+    },
+    "error": {
+      "invalid_proxy": "Proxy URL must start with http://."
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "连接 Codex 账号",
+        "description": "在使用 Codex CLI 的机器上，先运行 `codex login`（如尚未登录），然后把 `~/.codex/auth.json` 的完整内容粘贴到下方。\n\nHome Assistant 会保存自己的一份令牌副本并自动续期。\n\n如果 Home Assistant 无法直连 OpenAI，可以设置出站代理（http://host:port）——本次验证会立即使用该代理。",
+        "data": {
+          "auth_json": "~/.codex/auth.json 的内容",
+          "proxy_url": "出站代理地址（可选）"
+        }
+      },
+      "reauth_confirm": {
+        "title": "重新认证 Codex Usage",
+        "description": "已保存的令牌失效了。请重新粘贴 `~/.codex/auth.json` 的最新内容（必要时先运行 `codex login`）。",
+        "data": {
+          "auth_json": "~/.codex/auth.json 的内容"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth_json": "无法解析粘贴的内容。必须是 ~/.codex/auth.json 中的 JSON，且包含 tokens.access_token 和 tokens.refresh_token。",
+      "cannot_connect": "用量 API 拒绝了这些凭据。请确认 auth.json 是最新的（重新运行 `codex login`）。",
+      "invalid_proxy": "代理地址必须以 http:// 开头（aiohttp 通过 CONNECT 隧道转发 HTTPS，不支持 https:// 代理）。"
+    },
+    "abort": {
+      "already_configured": "该 Codex 账号已配置过",
+      "reauth_successful": "重新认证成功"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Codex Usage 选项",
+        "description": "配置轮询间隔和可选的出站代理。",
+        "data": {
+          "update_interval": "更新间隔（秒）",
+          "proxy_url": "出站代理地址（可选，http://host:port）"
+        }
+      }
+    },
+    "error": {
+      "invalid_proxy": "代理地址必须以 http:// 开头。"
+    }
+  }
+}
