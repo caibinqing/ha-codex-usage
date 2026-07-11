@@ -14,6 +14,16 @@
 | Weekly Reset Time | 周窗口重置时间 |
 | Plan Type | ChatGPT/Codex 套餐类型（如 `plus`、`pro`） |
 
+## 数据质量
+
+用量接口偶尔会返回瞬时异常值。集成会先验证百分比是否为 `0..100` 内的
+有限数字；当一次读数较上次可信值下降至少 5 个百分点，或突然上升至少
+50 个百分点时，会等待 5 秒并额外取样一次。只有新旧样本形成一致趋势时
+才会发布，否则该轮用量显示为 `unknown`，避免异常数值进入历史统计。
+
+这项复核不依赖 reset time，因此提前 reset 也能被连续低位样本确认。正常
+轮询不会增加请求；primary 和 secondary 同时异常时也只会共享一次复核请求。
+
 ## 安装
 
 把 `custom_components/codex_usage` 复制到 Home Assistant 的

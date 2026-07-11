@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import aiohttp
@@ -29,7 +30,19 @@ from .const import (
     OAUTH_CLIENT_ID,
     OAUTH_TOKEN_URL,
     RESET_TIME_JITTER_SECONDS,
+    USAGE_CONFIRM_CONSENSUS_TOLERANCE,
+    USAGE_CONFIRM_DELAY_SECONDS,
+    USAGE_DROP_CONFIRM_THRESHOLD,
+    USAGE_RISE_CONFIRM_THRESHOLD,
     USAGE_API_URL,
+)
+from .usage import (
+    async_resolve_usage_confirmation,
+    mark_usage_unknown,
+    parse_usage,
+    stabilize_reset_times,
+    suspicious_usage_keys,
+    update_trusted_usage,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,7 +70,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: CodexUsageConfigEntry) 
     return unload_ok
 
 
-async def _async_update_listener(hass: HomeAssistant, entry: CodexUsageConfigEntry) -> None:
+async def _async_update_listener(
+    hass: HomeAssistant, entry: CodexUsageConfigEntry
+) -> None:
     """Handle options update."""
     interval = entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
     entry.runtime_data.update_interval = timedelta(seconds=interval)
@@ -82,6 +97,8 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def __init__(self, hass: HomeAssistant, entry: CodexUsageConfigEntry) -> None:
         """Initialize the coordinator."""
         interval = entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        self._last_trusted_usage: dict[str, float] = {}
+        self._reported_usage_issues: set[str] = set()
         super().__init__(
             hass,
             _LOGGER,
@@ -103,6 +120,73 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             headers["ChatGPT-Account-Id"] = account_id
         proxy = (self.config_entry.options.get(CONF_PROXY_URL) or "").strip() or None
 
+        candidate = await self._async_fetch_usage(headers, proxy)
+        suspicious_keys = suspicious_usage_keys(
+            candidate,
+            self._last_trusted_usage,
+            drop_threshold=USAGE_DROP_CONFIRM_THRESHOLD,
+            rise_threshold=USAGE_RISE_CONFIRM_THRESHOLD,
+        )
+
+        confirmation_error: UpdateFailed | None = None
+        try:
+            parsed, confirmation = await async_resolve_usage_confirmation(
+                candidate,
+                lambda: self._async_fetch_usage(headers, proxy),
+                asyncio.sleep,
+                self._last_trusted_usage,
+                suspicious_keys,
+                delay_seconds=USAGE_CONFIRM_DELAY_SECONDS,
+                consensus_tolerance=USAGE_CONFIRM_CONSENSUS_TOLERANCE,
+            )
+        except UpdateFailed as err:
+            confirmation_error = err
+            parsed = mark_usage_unknown(candidate, suspicious_keys)
+        else:
+            if confirmation is not None:
+                for key in sorted(suspicious_keys):
+                    if parsed.get(key) is None:
+                        if key not in self._reported_usage_issues:
+                            _LOGGER.warning(
+                                "Ignoring ambiguous %s samples (trusted=%s, "
+                                "first=%s, confirmation=%s)",
+                                key,
+                                self._last_trusted_usage.get(key),
+                                candidate.get(key),
+                                confirmation.get(key),
+                            )
+                    elif parsed.get(key) != candidate.get(key):
+                        _LOGGER.debug(
+                            "Confirmed %s as %s after suspicious sample %s",
+                            key,
+                            parsed[key],
+                            candidate.get(key),
+                        )
+
+        if confirmation_error is not None:
+            for key in sorted(suspicious_keys - self._reported_usage_issues):
+                _LOGGER.warning(
+                    "Could not confirm suspicious %s value: %s",
+                    key,
+                    confirmation_error,
+                )
+
+        self._reported_usage_issues.update(
+            key for key in suspicious_keys if parsed.get(key) is None
+        )
+        for key in tuple(self._reported_usage_issues):
+            if parsed.get(key) is not None:
+                _LOGGER.info("Usage data for %s recovered", key)
+                self._reported_usage_issues.remove(key)
+
+        stabilize_reset_times(parsed, self.data, RESET_TIME_JITTER_SECONDS)
+        update_trusted_usage(self._last_trusted_usage, parsed)
+        return parsed
+
+    async def _async_fetch_usage(
+        self, headers: dict[str, str], proxy: str | None
+    ) -> dict[str, Any]:
+        """Fetch and parse one usage API sample."""
         try:
             session = aiohttp_client.async_get_clientsession(self.hass)
             resp = await session.get(
@@ -112,15 +196,17 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=aiohttp.ClientTimeout(total=15),
             )
             if resp.status in (401, 403):
-                raise ConfigEntryAuthFailed("Authentication failed - token may be invalid")
+                raise ConfigEntryAuthFailed(
+                    "Authentication failed - token may be invalid"
+                )
             resp.raise_for_status()
             raw = await resp.json()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             raise UpdateFailed(f"Error fetching usage data: {err}") from err
 
-        parsed = parse_usage(raw)
-        _stabilize_reset_times(parsed, self.data)
-        return parsed
+        if not isinstance(raw, dict):
+            raise UpdateFailed("Usage API returned a non-object response")
+        return parse_usage(raw)
 
     async def _ensure_valid_token(self) -> None:
         """Refresh the access token if it is about to expire."""
@@ -168,74 +254,3 @@ class CodexUsageCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 CONF_EXPIRES_AT: expires_at,
             },
         )
-
-
-def _window(limits: dict[str, Any], *keys: str) -> dict[str, Any] | None:
-    """Return the first present rate-limit window under any of the given keys."""
-    for key in keys:
-        window = limits.get(key)
-        if isinstance(window, dict):
-            return window
-    return None
-
-
-def _reset_time_iso(window: dict[str, Any]) -> str | None:
-    """Extract the window's reset time as an ISO timestamp string.
-
-    The undocumented API has been observed with both absolute ("resets_at",
-    epoch seconds or ISO string) and relative ("resets_in_seconds" /
-    "reset_after_seconds") fields depending on version.
-    """
-    for key in ("resets_at", "reset_at"):
-        val = window.get(key)
-        if isinstance(val, (int, float)):
-            return datetime.fromtimestamp(val, UTC).isoformat()
-        if isinstance(val, str) and val:
-            return val
-    for key in ("resets_in_seconds", "reset_after_seconds"):
-        val = window.get(key)
-        if isinstance(val, (int, float)):
-            return (datetime.now(UTC) + timedelta(seconds=val)).isoformat()
-    return None
-
-
-def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
-    """Parse raw API response into a flat sensor data dict."""
-    data: dict[str, Any] = {}
-
-    limits = raw.get("rate_limits") or raw.get("rate_limit") or {}
-    primary = _window(limits, "primary", "primary_window")
-    if primary:
-        data["session_usage_percent"] = primary.get("used_percent")
-        data["session_reset_time"] = _reset_time_iso(primary)
-
-    secondary = _window(limits, "secondary", "secondary_window")
-    if secondary:
-        data["week_usage_percent"] = secondary.get("used_percent")
-        data["week_reset_time"] = _reset_time_iso(secondary)
-
-    plan = raw.get("plan_type")
-    if plan:
-        data["plan_type"] = str(plan)
-
-    return data
-
-
-def _stabilize_reset_times(new: dict[str, Any], old: dict[str, Any] | None) -> None:
-    """Suppress sub-threshold jitter in reset timestamps, in place."""
-    if not old:
-        return
-    for key, new_val in new.items():
-        if not key.endswith("_reset_time"):
-            continue
-        old_val = old.get(key)
-        if not new_val or not old_val:
-            continue
-        try:
-            drift = (
-                datetime.fromisoformat(new_val) - datetime.fromisoformat(old_val)
-            ).total_seconds()
-        except (ValueError, TypeError):
-            continue
-        if abs(drift) < RESET_TIME_JITTER_SECONDS:
-            new[key] = old_val

@@ -18,6 +18,14 @@ DEFAULT_UPDATE_INTERVAL = 300  # seconds
 # recorder. Keep the previous value unless the new one moved by more than this.
 RESET_TIME_JITTER_SECONDS = 300
 
+# A single unexpected usage sample is re-fetched before it reaches Home
+# Assistant's recorder.  The thresholds deliberately target large, visible
+# spikes while allowing small upstream corrections through unchanged.
+USAGE_CONFIRM_DELAY_SECONDS = 5
+USAGE_DROP_CONFIRM_THRESHOLD = 5.0
+USAGE_RISE_CONFIRM_THRESHOLD = 50.0
+USAGE_CONFIRM_CONSENSUS_TOLERANCE = 5.0
+
 # Config keys
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"

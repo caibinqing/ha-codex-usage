@@ -1,0 +1,258 @@
+"""Parse and validate Codex rate-limit usage samples."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, Mapping
+
+USAGE_RESET_KEYS = {
+    "session_usage_percent": "session_reset_time",
+    "week_usage_percent": "week_reset_time",
+}
+USAGE_PERCENT_KEYS = tuple(USAGE_RESET_KEYS)
+
+type UsageChangeKind = Literal["decrease", "increase", "invalid"]
+
+
+def _window(limits: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+    """Return the first present rate-limit window under any given key."""
+    for key in keys:
+        window = limits.get(key)
+        if isinstance(window, dict):
+            return window
+    return None
+
+
+def _reset_time_iso(window: dict[str, Any], now: datetime | None = None) -> str | None:
+    """Extract a rate-limit window reset time as an ISO timestamp."""
+    for key in ("resets_at", "reset_at"):
+        value = window.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value, UTC).isoformat()
+            except (OSError, OverflowError, ValueError):
+                return None
+        if isinstance(value, str) and value:
+            return value
+
+    current_time = now or datetime.now(UTC)
+    for key in ("resets_in_seconds", "reset_after_seconds"):
+        value = window.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                seconds = float(value)
+                if not math.isfinite(seconds):
+                    return None
+                return (current_time + timedelta(seconds=seconds)).isoformat()
+            except (OverflowError, ValueError):
+                return None
+    return None
+
+
+def normalize_usage_percent(value: Any) -> float | None:
+    """Return a finite percentage in the inclusive 0..100 range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(normalized) or not 0 <= normalized <= 100:
+        return None
+    return normalized
+
+
+def parse_usage(raw: Mapping[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Parse an API response into a flat, validated sensor data dictionary."""
+    data: dict[str, Any] = {}
+
+    limits = raw.get("rate_limits")
+    if not isinstance(limits, dict) or not limits:
+        legacy_limits = raw.get("rate_limit")
+        if isinstance(legacy_limits, dict):
+            limits = legacy_limits
+    if not isinstance(limits, dict):
+        limits = {}
+
+    primary = _window(limits, "primary", "primary_window")
+    if primary is not None:
+        data["session_usage_percent"] = normalize_usage_percent(
+            primary.get("used_percent")
+        )
+        data["session_reset_time"] = _reset_time_iso(primary, now)
+
+    secondary = _window(limits, "secondary", "secondary_window")
+    if secondary is not None:
+        data["week_usage_percent"] = normalize_usage_percent(
+            secondary.get("used_percent")
+        )
+        data["week_reset_time"] = _reset_time_iso(secondary, now)
+
+    plan = raw.get("plan_type")
+    if plan:
+        data["plan_type"] = str(plan)
+
+    return data
+
+
+def stabilize_reset_times(
+    new: dict[str, Any],
+    old: Mapping[str, Any] | None,
+    jitter_seconds: float,
+) -> None:
+    """Suppress sub-threshold jitter in reset timestamps, in place."""
+    if not old:
+        return
+    for key, new_value in new.items():
+        if not key.endswith("_reset_time"):
+            continue
+        old_value = old.get(key)
+        if not new_value or not old_value:
+            continue
+        try:
+            drift = (
+                datetime.fromisoformat(new_value) - datetime.fromisoformat(old_value)
+            ).total_seconds()
+        except (ValueError, TypeError):
+            continue
+        if abs(drift) < jitter_seconds:
+            new[key] = old_value
+
+
+def usage_change_kind(
+    old_value: Any,
+    new_value: Any,
+    *,
+    drop_threshold: float,
+    rise_threshold: float,
+) -> UsageChangeKind | None:
+    """Classify a change that needs a confirming API sample."""
+    old_percent = normalize_usage_percent(old_value)
+    if old_percent is None:
+        return None
+
+    new_percent = normalize_usage_percent(new_value)
+    if new_percent is None:
+        return "invalid"
+    if old_percent - new_percent >= drop_threshold:
+        return "decrease"
+    if new_percent - old_percent >= rise_threshold:
+        return "increase"
+    return None
+
+
+def suspicious_usage_keys(
+    candidate: Mapping[str, Any],
+    last_trusted: Mapping[str, float],
+    *,
+    drop_threshold: float,
+    rise_threshold: float,
+) -> set[str]:
+    """Return usage keys whose candidate value needs a second sample."""
+    return {
+        key
+        for key in USAGE_PERCENT_KEYS
+        if key in last_trusted
+        and usage_change_kind(
+            last_trusted[key],
+            candidate.get(key),
+            drop_threshold=drop_threshold,
+            rise_threshold=rise_threshold,
+        )
+        is not None
+    }
+
+
+def resolve_confirmed_usage(
+    candidate: Mapping[str, Any],
+    confirmation: Mapping[str, Any],
+    last_trusted: Mapping[str, float],
+    suspicious_keys: set[str],
+    *,
+    consensus_tolerance: float,
+) -> dict[str, Any]:
+    """Resolve suspicious fields using agreement between two of three samples.
+
+    The previous trusted value, first candidate, and confirmation form the
+    three samples.  The confirmation is accepted only when it is close to the
+    candidate (a confirmed change) or to the previous value (a recovered
+    outlier).  Otherwise that one field becomes unknown.
+    """
+    resolved = dict(candidate)
+    for key in suspicious_keys:
+        old_percent = normalize_usage_percent(last_trusted.get(key))
+        candidate_percent = normalize_usage_percent(candidate.get(key))
+        confirmed_percent = normalize_usage_percent(confirmation.get(key))
+
+        has_consensus = confirmed_percent is not None and (
+            (
+                candidate_percent is not None
+                and abs(confirmed_percent - candidate_percent) <= consensus_tolerance
+            )
+            or (
+                old_percent is not None
+                and abs(confirmed_percent - old_percent) <= consensus_tolerance
+            )
+        )
+        resolved[key] = confirmed_percent if has_consensus else None
+
+        reset_key = USAGE_RESET_KEYS[key]
+        if has_consensus:
+            resolved[reset_key] = confirmation.get(reset_key)
+        else:
+            resolved[reset_key] = None
+
+    return resolved
+
+
+async def async_resolve_usage_confirmation(
+    candidate: Mapping[str, Any],
+    confirmation_fetch: Callable[[], Awaitable[Mapping[str, Any]]],
+    sleep: Callable[[float], Awaitable[None]],
+    last_trusted: Mapping[str, float],
+    suspicious_keys: set[str],
+    *,
+    delay_seconds: float,
+    consensus_tolerance: float,
+) -> tuple[dict[str, Any], Mapping[str, Any] | None]:
+    """Fetch one shared confirmation and resolve each suspicious field."""
+    if not suspicious_keys:
+        return dict(candidate), None
+
+    await sleep(delay_seconds)
+    confirmation = await confirmation_fetch()
+    return (
+        resolve_confirmed_usage(
+            candidate,
+            confirmation,
+            last_trusted,
+            suspicious_keys,
+            consensus_tolerance=consensus_tolerance,
+        ),
+        confirmation,
+    )
+
+
+def mark_usage_unknown(
+    candidate: Mapping[str, Any], suspicious_keys: set[str]
+) -> dict[str, Any]:
+    """Return a copy with only suspicious usage values marked unknown."""
+    result = dict(candidate)
+    for key in suspicious_keys:
+        result[key] = None
+        result[USAGE_RESET_KEYS[key]] = None
+    return result
+
+
+def update_trusted_usage(trusted: dict[str, float], sample: Mapping[str, Any]) -> None:
+    """Update the trusted baseline with valid values from a resolved sample."""
+    for key in USAGE_PERCENT_KEYS:
+        value = normalize_usage_percent(sample.get(key))
+        if value is not None:
+            trusted[key] = value
