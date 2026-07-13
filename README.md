@@ -1,3 +1,5 @@
+**中文** | [English](README.en.md)
+
 # Codex Usage for Home Assistant
 
 一个极简的 Home Assistant 自定义集成，用于跟踪 OpenAI Codex（ChatGPT 订阅）
