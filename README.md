@@ -13,6 +13,15 @@
 | Weekly Usage | 周窗口已用百分比 |
 | Weekly Reset Time | 周窗口重置时间 |
 | Plan Type | ChatGPT/Codex 套餐类型（如 `plus`、`pro`） |
+| Credits Balance | 按量付费额度余额 |
+| Rate Limit Reset Credits | 可用的限额重置券数量 |
+| Spend Limit Reached | 是否已触及消费上限（binary sensor） |
+| `<模型名>` Usage / Reset Time | 每个附加模型限额（如 GPT-5.3-Codex-Spark）的用量与重置时间 |
+
+窗口按接口返回的 `limit_window_seconds` 时长识别（≥ 1 天视为周窗口），
+而不是按 primary/secondary 位置猜测；某个窗口不存在时（例如官方临时取消
+5 小时限制），对应传感器显示为 unavailable。附加模型限额在首次加载时
+发现；接口后来新增的模型限额会在重载集成或重启后出现。
 
 ## 数据质量
 

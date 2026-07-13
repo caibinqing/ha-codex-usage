@@ -44,4 +44,24 @@ SENSOR_DEFINITIONS = [
     ("week_usage_percent", "Weekly Usage", "%", "mdi:calendar-week", None),
     ("week_reset_time", "Weekly Reset Time", None, "mdi:calendar-clock", "timestamp"),
     ("plan_type", "Plan Type", None, "mdi:card-account-details", None),
+    ("credits_balance", "Credits Balance", None, "mdi:cash-multiple", None),
+    (
+        "reset_credits_available",
+        "Rate Limit Reset Credits",
+        None,
+        "mdi:ticket-confirmation",
+        None,
+    ),
+]
+
+# Binary sensor definitions: (key, name, icon)
+BINARY_SENSOR_DEFINITIONS = [
+    ("spend_limit_reached", "Spend Limit Reached", "mdi:cash-lock"),
+]
+
+# Per-model additional rate limits (parse_usage's "additional_limits") get one
+# sensor per field here: (field, name suffix, unit, icon, device_class)
+ADDITIONAL_LIMIT_SENSOR_FIELDS = [
+    ("usage_percent", "Usage", "%", "mdi:speedometer", None),
+    ("reset_time", "Reset Time", None, "mdi:timer-refresh-outline", "timestamp"),
 ]

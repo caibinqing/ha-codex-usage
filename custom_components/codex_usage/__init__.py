@@ -47,7 +47,7 @@ from .usage import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 type CodexUsageConfigEntry = ConfigEntry[CodexUsageCoordinator]
 

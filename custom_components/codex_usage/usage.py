@@ -71,6 +71,21 @@ def _reset_time_iso(window: dict[str, Any], now: datetime | None = None) -> str 
     return None
 
 
+def _decimal_number(value: Any) -> float | None:
+    """Parse a finite number that the API may send as a decimal string."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def normalize_usage_percent(value: Any) -> float | None:
     """Return a finite percentage in the inclusive 0..100 range."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -118,7 +133,70 @@ def parse_usage(raw: Mapping[str, Any], now: datetime | None = None) -> dict[str
     if plan:
         data["plan_type"] = str(plan)
 
+    credits = raw.get("credits")
+    if isinstance(credits, dict):
+        data["credits_balance"] = _decimal_number(credits.get("balance"))
+
+    reset_credits = raw.get("rate_limit_reset_credits")
+    if isinstance(reset_credits, dict):
+        count = reset_credits.get("available_count")
+        data["reset_credits_available"] = (
+            count
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            else None
+        )
+
+    spend_control = raw.get("spend_control")
+    if isinstance(spend_control, dict):
+        reached = spend_control.get("reached")
+        data["spend_limit_reached"] = reached if isinstance(reached, bool) else None
+
+    additional = _parse_additional_limits(raw.get("additional_rate_limits"), now)
+    if additional:
+        data["additional_limits"] = additional
+
     return data
+
+
+def _parse_additional_limits(
+    entries: Any, now: datetime | None = None
+) -> dict[str, dict[str, Any]]:
+    """Parse per-model rate limits keyed by their stable feature slug."""
+    limits: dict[str, dict[str, Any]] = {}
+    if not isinstance(entries, list):
+        return limits
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        feature = entry.get("metered_feature")
+        if not isinstance(feature, str) or not feature or feature in limits:
+            continue
+        rate_limit = entry.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            continue
+        window = _window(rate_limit, "primary", "primary_window")
+        if window is None:
+            continue
+        name = entry.get("limit_name")
+        limits[feature] = {
+            "name": name if isinstance(name, str) and name else feature,
+            "usage_percent": normalize_usage_percent(window.get("used_percent")),
+            "reset_time": _reset_time_iso(window, now),
+        }
+    return limits
+
+
+def _stable_reset_value(new_value: Any, old_value: Any, jitter_seconds: float) -> Any:
+    """Return the old timestamp when the new one drifted less than the jitter."""
+    if not new_value or not old_value:
+        return new_value
+    try:
+        drift = (
+            datetime.fromisoformat(new_value) - datetime.fromisoformat(old_value)
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return new_value
+    return old_value if abs(drift) < jitter_seconds else new_value
 
 
 def stabilize_reset_times(
@@ -130,19 +208,19 @@ def stabilize_reset_times(
     if not old:
         return
     for key, new_value in new.items():
-        if not key.endswith("_reset_time"):
-            continue
-        old_value = old.get(key)
-        if not new_value or not old_value:
-            continue
-        try:
-            drift = (
-                datetime.fromisoformat(new_value) - datetime.fromisoformat(old_value)
-            ).total_seconds()
-        except (ValueError, TypeError):
-            continue
-        if abs(drift) < jitter_seconds:
-            new[key] = old_value
+        if key.endswith("_reset_time"):
+            new[key] = _stable_reset_value(new_value, old.get(key), jitter_seconds)
+
+    new_limits = new.get("additional_limits")
+    old_limits = old.get("additional_limits")
+    if not isinstance(new_limits, dict) or not isinstance(old_limits, dict):
+        return
+    for feature, window in new_limits.items():
+        old_window = old_limits.get(feature)
+        if isinstance(window, dict) and isinstance(old_window, dict):
+            window["reset_time"] = _stable_reset_value(
+                window.get("reset_time"), old_window.get("reset_time"), jitter_seconds
+            )
 
 
 def usage_change_kind(
