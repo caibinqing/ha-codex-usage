@@ -108,6 +108,93 @@ class ParseUsageTests(unittest.TestCase):
 
         self.assertEqual(result["session_usage_percent"], 12.0)
 
+    def test_weekly_primary_window_maps_to_week_sensors(self) -> None:
+        # Live shape from 2026-07: the 5-hour window was removed and the
+        # weekly window moved into the primary slot.
+        result = usage.parse_usage(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 11,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 596056,
+                        "reset_at": 1784511343,
+                    },
+                    "secondary_window": None,
+                },
+                "plan_type": "pro",
+            }
+        )
+
+        self.assertEqual(result["week_usage_percent"], 11.0)
+        self.assertEqual(result["week_reset_time"], "2026-07-20T01:35:43+00:00")
+        self.assertNotIn("session_usage_percent", result)
+        self.assertNotIn("session_reset_time", result)
+
+    def test_window_duration_overrides_position(self) -> None:
+        result = usage.parse_usage(
+            {
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 11,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 18000,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["week_usage_percent"], 11.0)
+        self.assertEqual(result["session_usage_percent"], 42.0)
+
+    def test_window_minutes_duration_is_recognized(self) -> None:
+        result = usage.parse_usage(
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 5, "window_minutes": 300},
+                    "secondary": {"used_percent": 30, "window_minutes": 10080},
+                }
+            }
+        )
+
+        self.assertEqual(result["session_usage_percent"], 5.0)
+        self.assertEqual(result["week_usage_percent"], 30.0)
+
+    def test_duplicate_bucket_keeps_first_window(self) -> None:
+        result = usage.parse_usage(
+            {
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 11,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary": {
+                        "used_percent": 99,
+                        "limit_window_seconds": 604800,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["week_usage_percent"], 11.0)
+        self.assertNotIn("session_usage_percent", result)
+
+    def test_invalid_duration_falls_back_to_position(self) -> None:
+        result = usage.parse_usage(
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 5, "limit_window_seconds": True},
+                    "secondary": {"used_percent": 30, "limit_window_seconds": "week"},
+                }
+            }
+        )
+
+        self.assertEqual(result["session_usage_percent"], 5.0)
+        self.assertEqual(result["week_usage_percent"], 30.0)
+
     def test_rejects_overflowing_relative_reset(self) -> None:
         result = usage.parse_usage(
             {

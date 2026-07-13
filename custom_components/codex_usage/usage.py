@@ -13,6 +13,11 @@ USAGE_RESET_KEYS = {
 }
 USAGE_PERCENT_KEYS = tuple(USAGE_RESET_KEYS)
 
+# Windows at least this long are the weekly limit; shorter ones are the
+# 5-hour session limit. Position alone is unreliable: when OpenAI dropped the
+# 5-hour window in July 2026, the weekly window moved into the primary slot.
+WEEK_WINDOW_MIN_SECONDS = 24 * 3600
+
 type UsageChangeKind = Literal["decrease", "increase", "invalid"]
 
 
@@ -22,6 +27,17 @@ def _window(limits: dict[str, Any], *keys: str) -> dict[str, Any] | None:
         window = limits.get(key)
         if isinstance(window, dict):
             return window
+    return None
+
+
+def _window_seconds(window: dict[str, Any]) -> float | None:
+    """Extract a rate-limit window's duration in seconds, if advertised."""
+    for key, scale in (("limit_window_seconds", 1), ("window_minutes", 60)):
+        value = window.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+            return float(value) * scale
     return None
 
 
@@ -80,19 +96,23 @@ def parse_usage(raw: Mapping[str, Any], now: datetime | None = None) -> dict[str
     if not isinstance(limits, dict):
         limits = {}
 
-    primary = _window(limits, "primary", "primary_window")
-    if primary is not None:
-        data["session_usage_percent"] = normalize_usage_percent(
-            primary.get("used_percent")
-        )
-        data["session_reset_time"] = _reset_time_iso(primary, now)
-
-    secondary = _window(limits, "secondary", "secondary_window")
-    if secondary is not None:
-        data["week_usage_percent"] = normalize_usage_percent(
-            secondary.get("used_percent")
-        )
-        data["week_reset_time"] = _reset_time_iso(secondary, now)
+    for position_keys, positional_bucket in (
+        (("primary", "primary_window"), "session"),
+        (("secondary", "secondary_window"), "week"),
+    ):
+        window = _window(limits, *position_keys)
+        if window is None:
+            continue
+        seconds = _window_seconds(window)
+        if seconds is None:
+            bucket = positional_bucket
+        else:
+            bucket = "week" if seconds >= WEEK_WINDOW_MIN_SECONDS else "session"
+        percent_key = f"{bucket}_usage_percent"
+        if percent_key in data:
+            continue
+        data[percent_key] = normalize_usage_percent(window.get("used_percent"))
+        data[USAGE_RESET_KEYS[percent_key]] = _reset_time_iso(window, now)
 
     plan = raw.get("plan_type")
     if plan:
